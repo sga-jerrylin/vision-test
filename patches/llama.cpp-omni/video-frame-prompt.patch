@@ -1,0 +1,750 @@
+diff --git a/tools/omni/omni.cpp b/tools/omni/omni.cpp
+index c461ac1..6de5dd6 100644
+--- a/tools/omni/omni.cpp
++++ b/tools/omni/omni.cpp
+@@ -3907,33 +3907,25 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
+     ctx_omni->audio_emb.resize((10 + 1) * 4096); // temp fix for audio embed
+     print_with_timestamp("=== omni_init: loading APM model\n");
+     if (params->apm_model.empty()) {
+-        LOG_ERR("%s: error: apm_model path is empty\n", __func__);
+-        if (ctx_omni->use_tts) {
+-            llama_free(ctx_omni->ctx_tts_llama);
+-            llama_free_model(ctx_omni->model_tts);
+-            common_sampler_free(ctx_omni->ctx_tts_sampler);
+-        }
+-        llama_free(ctx_llama);
+-        llama_free_model(model);
+-        common_sampler_free(sampler);
+-        delete ctx_omni;
+-        return NULL;
+-    }
+-    ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
+-    print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
+-    if (ctx_omni->ctx_audio == nullptr) {
+-        LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
+-        // 清理 TTS 模型资源（如果已加载）
+-        if (ctx_omni->use_tts) {
+-            llama_free(ctx_omni->ctx_tts_llama);
+-            llama_free_model(ctx_omni->model_tts);
+-            common_sampler_free(ctx_omni->ctx_tts_sampler);
+-        }
+-        llama_free(ctx_llama);
+-        llama_free_model(model);
+-        common_sampler_free(sampler);
+-        delete ctx_omni;
+-        return NULL;
++        print_with_timestamp("=== omni_init: APM/ASR disabled (no audio encoder model loaded)\n");
++        ctx_omni->ctx_audio = nullptr;
++    } else {
++        ctx_omni->ctx_audio = audition_init(params->apm_model.c_str(), audition_context_params{true, GGML_LOG_LEVEL_INFO});
++        print_with_timestamp("APM: init from %s\n", params->apm_model.c_str());
++        if (ctx_omni->ctx_audio == nullptr) {
++            LOG_ERR("%s: error: failed to init audition model from %s\n", __func__, params->apm_model.c_str());
++            // 清理 TTS 模型资源（如果已加载）
++            if (ctx_omni->use_tts) {
++                llama_free(ctx_omni->ctx_tts_llama);
++                llama_free_model(ctx_omni->model_tts);
++                common_sampler_free(ctx_omni->ctx_tts_sampler);
++            }
++            llama_free(ctx_llama);
++            llama_free_model(model);
++            common_sampler_free(sampler);
++            delete ctx_omni;
++            return NULL;
++        }
+     }
+ 
+     ctx_omni->n_past = 0;
+@@ -4341,7 +4333,9 @@ void omni_free(struct omni_context * ctx_omni) {
+     }
+     
+     delete ctx_omni->ctx_vision;
+-    audition_free(ctx_omni->ctx_audio);
++    if (ctx_omni->ctx_audio) {
++        audition_free(ctx_omni->ctx_audio);
++    }
+     
+     if (ctx_omni->use_tts) {
+         llama_free(ctx_omni->ctx_tts_llama);
+@@ -4657,6 +4651,11 @@ void llm_thread_func(omni_context* ctx_omni, common_params* params){
+                     }
+                 }
+                 
++                if (!embeds->user_prompt.empty()) {
++                    eval_string(ctx_omni, params, embeds->user_prompt.c_str(), params->n_batch, &ctx_omni->n_past, false);
++                    print_with_timestamp("LLM thread: appended frame prompt, chars=%zu\n", embeds->user_prompt.size());
++                }
++                
+                 // 🔧 [#39 滑动窗口] 注册 unit 结束
+                 if (ctx_omni->sliding_window_config.mode != "off") {
+                     std::string input_type = embeds->vision_embed.size() > 0 ? "omni" : "audio";
+@@ -8934,7 +8933,7 @@ void t2w_thread_func(struct omni_context * ctx_omni, common_params *params) {
+     }
+ }
+ 
+-bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums) {
++bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::string img_fname, int index, int max_slice_nums, std::string user_prompt) {
+     
+     // 只有在新一轮开始时 (index == 0) 才需要等待上一轮 TTS 完成
+     // 同一轮内的后续 prefill (index >= 1) 不需要等待
+@@ -9037,7 +9036,23 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
+         //   [ref_audio APM embedding]
+         //   <|audio_end|><|im_end|>
+         
+-        if (ctx_omni->duplex_mode && aud_fname.length() > 0) {
++        if (ctx_omni->ctx_audio == nullptr) {
++            std::string raw_video_prompt = ctx_omni->media_type == 2
++                ? ctx_omni->omni_assistant_prompt
++                : ctx_omni->audio_assistant_prompt;
++            std::string video_only_prompt = raw_video_prompt.empty()
++                ? "<|im_start|>system\n"
++                  "You are a real-time video monitoring assistant. Watch the video frames carefully, "
++                  "report only important events, and keep responses concise and factual."
++                  "<|im_end|>\n"
++                  "<|im_start|>user\n"
++                : raw_video_prompt;
++            if (video_only_prompt.rfind("<|", 0) != 0) {
++                video_only_prompt = "<|im_start|>system\n" + video_only_prompt + "<|im_end|>\n<|im_start|>user\n";
++            }
++            eval_string(ctx_omni, ctx_omni->params, video_only_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
++            print_with_timestamp("stream_prefill(index=0): video-only system prompt initialized without audio ref\n");
++        } else if (ctx_omni->duplex_mode && aud_fname.length() > 0) {
+             // 双工模式：参考音频需要送入 LLM
+             
+             // Step 1: 评估 prefix (voice_clone_prompt，包含 <|audio_start|>)
+@@ -9180,7 +9195,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
+                 }
+                 LOG_INF("%s: prefilled %d vision chunks (%d tokens each)\n", __func__, n_chunks, tokens_per_chunk);
+             }
+-            if (aud_fname.length() > 0) {
++            if (ctx_omni->ctx_audio != nullptr && aud_fname.length() > 0) {
+                 print_with_timestamp("stream_prefill(index=%d): processing user audio: %s\n", index, aud_fname.c_str());
+                 auto * embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
+@@ -9196,6 +9211,10 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
+                     LOG_WRN("%s: audio encoding failed, skipping audio for this frame\n", __func__);
+                 }
+             }
++            if (!user_prompt.empty()) {
++                eval_string(ctx_omni, ctx_omni->params, user_prompt.c_str(), ctx_omni->params->n_batch, &ctx_omni->n_past, false);
++                print_with_timestamp("stream_prefill(index=%d): appended frame prompt, chars=%zu\n", index, user_prompt.size());
++            }
+         }
+         else {
+             // async 模式：将 embeds 加入队列，由 LLM 线程处理
+@@ -9224,7 +9243,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
+             }
+             //audio
+             // 只有在音频路径非空时才处理音频
+-            if (aud_fname.length() > 0) {
++            if (ctx_omni->ctx_audio != nullptr && aud_fname.length() > 0) {
+                 LOG_INF("%s: aud_fname:%s\n", __func__, aud_fname.c_str());
+                 auto * audio_embeds = omni_audio_embed_make_with_filename(ctx_omni->ctx_audio, ctx_omni->params->cpuparams.n_threads, aud_fname);
+                 // 🔧 [修复] 音频太短时会在 audition_audio_preprocess 中自动 pad 静音到 100ms
+@@ -9240,6 +9259,7 @@ bool stream_prefill(struct omni_context * ctx_omni, std::string aud_fname, std::
+                 }
+             }
+             omni_embeds->index = index;
++            omni_embeds->user_prompt = user_prompt;
+             // 🔧 [整合] <|im_start|>user\n 已在 sys prompt 末尾添加，后续轮次在 stream_decode 结束时添加
+             // 不再需要在这里设置 is_round_start 标记
+             
+@@ -9408,7 +9428,7 @@ bool stream_decode(struct omni_context * ctx_omni, std::string debug_dir, int ro
+         // 组合导致模型第一个 chunk 直接 SPEAK。
+         // 这里直接发 __IS_LISTEN__ 到 text_queue 走 LISTEN 分支，不启动 LLM 采样。
+         // 用户音频的 KV cache 已经在 stream_prefill 阶段写入，所以不会丢失上下文。
+-        if (ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
++        if (ctx_omni->ctx_audio != nullptr && ctx_omni->force_listen_used < ctx_omni->force_listen_count) {
+             ctx_omni->force_listen_used++;
+             ctx_omni->slide_last_was_listen = true;
+             ctx_omni->ended_with_listen = true;
+diff --git a/tools/omni/omni.h b/tools/omni/omni.h
+index 7b5449d..4711e5a 100644
+--- a/tools/omni/omni.h
++++ b/tools/omni/omni.h
+@@ -36,11 +36,12 @@ struct omni_embed {
+     int n_pos;
+ };
+ struct omni_embeds{
+-    // 🔧 [高清模式] vision_embed 改为二维 vector
++    // 馃敡 [楂樻竻妯″紡] vision_embed 鏀逛负浜岀淮 vector
+     // vision_embed[0] = overview embed (64 tokens * hidden_size)
+-    // vision_embed[1..n] = slice embeds (各 64 tokens * hidden_size)
++    // vision_embed[1..n] = slice embeds (鍚?64 tokens * hidden_size)
+     std::vector<std::vector<float>> vision_embed;
+     std::vector<float> audio_embed;
++    std::string user_prompt;
+     int index = 0;
+     int end_flag = false;
+ };
+@@ -60,7 +61,7 @@ struct T2WOut {
+     std::vector<llama_token> audio_tokens;  // Audio token IDs (25 tokens per chunk)
+     bool is_final = false;  // Whether this is the final chunk (turn end)
+     bool is_chunk_end = false;  // Whether this is the end of a TTS chunk (flush buffer, but not final)
+-    int round_idx = -1;  // 🔧 [修复目录同步] 轮次索引，由 TTS 线程设置，T2W 线程使用此值确定输出目录
++    int round_idx = -1;  // 馃敡 [淇鐩綍鍚屾] 杞绱㈠紩锛岀敱 TTS 绾跨▼璁剧疆锛孴2W 绾跨▼浣跨敤姝ゅ€肩‘瀹氳緭鍑虹洰褰?
+ };
+ 
+ struct T2WThreadInfo {
+@@ -76,41 +77,41 @@ struct T2WThreadInfo {
+ 
+ // Projector Semantic: 2-layer MLP (LLM hidden states -> TTS embedding)
+ // forward(x): relu(linear1(x)) -> linear2
+-// ==================== 滑动窗口配置 ====================
+-// 🔧 [#39] 基于 Python stream_decoder.py 的 DuplexWindowConfig
++// ==================== 婊戝姩绐楀彛閰嶇疆 ====================
++// 馃敡 [#39] 鍩轰簬 Python stream_decoder.py 鐨?DuplexWindowConfig
+ struct SlidingWindowConfig {
+-    // 滑窗模式: "off" / "basic" / "context"
+-    // - "off": 禁用滑窗
+-    // - "basic": 基础滑窗（按 cache 长度触发）
+-    // - "context": 带 context 的滑窗（保留生成文本到 previous）
++    // 婊戠獥妯″紡: "off" / "basic" / "context"
++    // - "off": 绂佺敤婊戠獥
++    // - "basic": 鍩虹婊戠獥锛堟寜 cache 闀垮害瑙﹀彂锛?
++    // - "context": 甯?context 鐨勬粦绐楋紙淇濈暀鐢熸垚鏂囨湰鍒?previous锛?
+     std::string mode = "off";
+     
+-    // 基础滑窗参数
+-    int high_water_tokens = 4000;  // 高水位线：超过此值触发滑窗
+-    int low_water_tokens = 3500;   // 低水位线：滑窗后保留到此值
++    // 鍩虹婊戠獥鍙傛暟
++    int high_water_tokens = 4000;  // 楂樻按浣嶇嚎锛氳秴杩囨鍊艰Е鍙戞粦绐?
++    int low_water_tokens = 3500;   // 浣庢按浣嶇嚎锛氭粦绐楀悗淇濈暀鍒版鍊?
+     
+-    // RoPE 参数
++    // RoPE 鍙傛暟
+     float rope_theta = 10000.0f;   // RoPE base frequency
+ };
+ 
+-// Unit 历史记录条目
++// Unit 鍘嗗彶璁板綍鏉＄洰
+ struct UnitEntry {
+     int unit_id = -1;              // Unit ID
+-    int length = 0;                // 该 unit 在 cache 中的长度（tokens 数）
+-    std::string type;              // 类型: "audio" / "video" / "omni" / "system" / "response"
+-    std::vector<llama_token> generated_tokens;  // 生成的 tokens
+-    bool is_listen = false;        // 是否是 listen 状态
+-    // 🔧 [turn 级滑窗] 该 unit 所属 turn 的 id
+-    // 一个 turn = 一轮完整的 [用户输入 prefill + 模型 response] 序列
+-    // 同一 turn 内的 prefill unit 和 response unit 共享同一个 turn_id，
+-    // turn 结束（TURN_EOS / ended_with_listen 等）时 current_turn_id++，
+-    // 滑窗时优先把整个最早的已完成 turn 一次性丢掉。
++    int length = 0;                // 璇?unit 鍦?cache 涓殑闀垮害锛坱okens 鏁帮級
++    std::string type;              // 绫诲瀷: "audio" / "video" / "omni" / "system" / "response"
++    std::vector<llama_token> generated_tokens;  // 鐢熸垚鐨?tokens
++    bool is_listen = false;        // 鏄惁鏄?listen 鐘舵€?
++    // 馃敡 [turn 绾ф粦绐梋 璇?unit 鎵€灞?turn 鐨?id
++    // 涓€涓?turn = 涓€杞畬鏁寸殑 [鐢ㄦ埛杈撳叆 prefill + 妯″瀷 response] 搴忓垪
++    // 鍚屼竴 turn 鍐呯殑 prefill unit 鍜?response unit 鍏变韩鍚屼竴涓?turn_id锛?
++    // turn 缁撴潫锛圱URN_EOS / ended_with_listen 绛夛級鏃?current_turn_id++锛?
++    // 婊戠獥鏃朵紭鍏堟妸鏁翠釜鏈€鏃╃殑宸插畬鎴?turn 涓€娆℃€т涪鎺夈€?
+     int turn_id = 0;
+ };
+ 
+ struct projector_hparams {
+-    int32_t in_dim  = 4096;  // 输入维度 (LLM hidden size)
+-    int32_t out_dim = 768;   // 输出维度 (TTS embedding size)
++    int32_t in_dim  = 4096;  // 杈撳叆缁村害 (LLM hidden size)
++    int32_t out_dim = 768;   // 杈撳嚭缁村害 (TTS embedding size)
+ };
+ 
+ struct projector_layer {
+@@ -139,14 +140,14 @@ struct omni_context {
+     struct llama_model * model = NULL;
+     struct common_sampler * ctx_sampler = NULL;
+     
+-    // 🔧 [单双工适配] 是否拥有模型（用于 omni_free 时决定是否释放模型）
+-    // true: omni_init 内部加载的模型，omni_free 时需要释放
+-    // false: 外部传入的已有模型（模型复用），omni_free 时不释放
++    // 馃敡 [鍗曞弻宸ラ€傞厤] 鏄惁鎷ユ湁妯″瀷锛堢敤浜?omni_free 鏃跺喅瀹氭槸鍚﹂噴鏀炬ā鍨嬶級
++    // true: omni_init 鍐呴儴鍔犺浇鐨勬ā鍨嬶紝omni_free 鏃堕渶瑕侀噴鏀?
++    // false: 澶栭儴浼犲叆鐨勫凡鏈夋ā鍨嬶紙妯″瀷澶嶇敤锛夛紝omni_free 鏃朵笉閲婃斁
+     bool owns_model = true;
+ 
+-    // 🔧 [Length Penalty] 用于调整 EOS token 的采样概率
+-    // length_penalty > 1.0 会降低 EOS 概率，让模型生成更长的输出
+-    // length_penalty < 1.0 会增加 EOS 概率，让模型更早结束
++    // 馃敡 [Length Penalty] 鐢ㄤ簬璋冩暣 EOS token 鐨勯噰鏍锋鐜?
++    // length_penalty > 1.0 浼氶檷浣?EOS 姒傜巼锛岃妯″瀷鐢熸垚鏇撮暱鐨勮緭鍑?
++    // length_penalty < 1.0 浼氬鍔?EOS 姒傜巼锛岃妯″瀷鏇存棭缁撴潫
+     float length_penalty = 1.0f;
+ 
+     struct llama_context * ctx_tts_llama = NULL;
+@@ -165,47 +166,47 @@ struct omni_context {
+     int n_past = 0;
+     int n_keep = 0;
+     
+-    // ==================== 轮次边界管理（用于智能滑动窗口） ====================
+-    // 每轮对话开始时的 n_past 位置
+-    // round_start_positions[i] 表示第 i 轮开始的 n_past 位置
+-    // 第 i 轮的范围是 [round_start_positions[i], round_start_positions[i+1])
+-    // 最后一轮的结束位置是当前 n_past
++    // ==================== 杞杈圭晫绠＄悊锛堢敤浜庢櫤鑳芥粦鍔ㄧ獥鍙ｏ級 ====================
++    // 姣忚疆瀵硅瘽寮€濮嬫椂鐨?n_past 浣嶇疆
++    // round_start_positions[i] 琛ㄧず绗?i 杞紑濮嬬殑 n_past 浣嶇疆
++    // 绗?i 杞殑鑼冨洿鏄?[round_start_positions[i], round_start_positions[i+1])
++    // 鏈€鍚庝竴杞殑缁撴潫浣嶇疆鏄綋鍓?n_past
+     std::vector<int> round_start_positions;
+     
+-    // 滑动窗口保留的最大上下文长度（不包括 n_keep）
+-    // 设置为 0 表示使用旧的按比例删除策略
++    // 婊戝姩绐楀彛淇濈暀鐨勬渶澶т笂涓嬫枃闀垮害锛堜笉鍖呮嫭 n_keep锛?
++    // 璁剧疆涓?0 琛ㄧず浣跨敤鏃х殑鎸夋瘮渚嬪垹闄ょ瓥鐣?
+     int max_preserved_context = 2048;
+     
+-    // ==================== 滑动窗口状态 (#39) ====================
++    // ==================== 婊戝姩绐楀彛鐘舵€?(#39) ====================
+     SlidingWindowConfig sliding_window_config;
+     
+-    // Unit 历史管理（用于按 unit 粒度删除）
++    // Unit 鍘嗗彶绠＄悊锛堢敤浜庢寜 unit 绮掑害鍒犻櫎锛?
+     std::vector<UnitEntry> unit_history;
+     int next_unit_id = 0;
+-    int pending_unit_id = -1;           // 当前正在处理的 unit ID
+-    int pending_unit_start_cache_len = 0;  // pending unit 开始时的 cache 长度
++    int pending_unit_id = -1;           // 褰撳墠姝ｅ湪澶勭悊鐨?unit ID
++    int pending_unit_start_cache_len = 0;  // pending unit 寮€濮嬫椂鐨?cache 闀垮害
+     
+-    // System prompt 保护长度（这部分永远不会被滑窗删除）
++    // System prompt 淇濇姢闀垮害锛堣繖閮ㄥ垎姘歌繙涓嶄細琚粦绐楀垹闄わ級
+     int system_preserve_length = 0;
+     
+-    // RoPE 位置偏移（用于 RoPE 位置重对齐后的 position_ids 计算）
++    // RoPE 浣嶇疆鍋忕Щ锛堢敤浜?RoPE 浣嶇疆閲嶅榻愬悗鐨?position_ids 璁＄畻锛?
+     int position_offset = 0;
+     
+-    // 滑窗统计
+-    int sliding_event_count = 0;         // 滑窗触发次数
+-    int total_dropped_tokens = 0;        // 总共丢弃的 token 数
+-    int total_dropped_units = 0;         // 总共被移除的 UnitEntry 条目数；
+-                                         //   两种模式语义统一：turn 模式下含"整 turn 丢带走的 + fallback 丢的"，
+-                                         //   非 turn 模式下就是按 unit 丢的总数
+-    int total_dropped_turns = 0;         // 总共丢弃的 turn 数（按 turn 粒度）；非 turn 模式恒为 0
+-    int total_unit_fallbacks = 0;        // 仅 turn 模式：整 turn 丢不动 → 退化按 unit 丢的次数；
+-                                         //   非 turn 模式恒为 0
+-
+-    // 🔧 [turn 级滑窗] 当前正在构建的 turn id
+-    // 每个 UnitEntry 注册时会被打上 current_turn_id，
+-    // 在 turn 边界（round_start_positions 推进处）会把 current_turn_id++。
+-    // sliding_window_enforce 先按 turn 丢，当 unit_history 里只剩 turn_id == current_turn_id
+-    // 的 unit（即只剩当前正在构建、还没收尾的 turn）时，退化为按 unit 丢。
++    // 婊戠獥缁熻
++    int sliding_event_count = 0;         // 婊戠獥瑙﹀彂娆℃暟
++    int total_dropped_tokens = 0;        // 鎬诲叡涓㈠純鐨?token 鏁?
++    int total_dropped_units = 0;         // 鎬诲叡琚Щ闄ょ殑 UnitEntry 鏉＄洰鏁帮紱
++                                         //   涓ょ妯″紡璇箟缁熶竴锛歵urn 妯″紡涓嬪惈"鏁?turn 涓㈠甫璧扮殑 + fallback 涓㈢殑"锛?
++                                         //   闈?turn 妯″紡涓嬪氨鏄寜 unit 涓㈢殑鎬绘暟
++    int total_dropped_turns = 0;         // 鎬诲叡涓㈠純鐨?turn 鏁帮紙鎸?turn 绮掑害锛夛紱闈?turn 妯″紡鎭掍负 0
++    int total_unit_fallbacks = 0;        // 浠?turn 妯″紡锛氭暣 turn 涓笉鍔?鈫?閫€鍖栨寜 unit 涓㈢殑娆℃暟锛?
++                                         //   闈?turn 妯″紡鎭掍负 0
++
++    // 馃敡 [turn 绾ф粦绐梋 褰撳墠姝ｅ湪鏋勫缓鐨?turn id
++    // 姣忎釜 UnitEntry 娉ㄥ唽鏃朵細琚墦涓?current_turn_id锛?
++    // 鍦?turn 杈圭晫锛坮ound_start_positions 鎺ㄨ繘澶勶級浼氭妸 current_turn_id++銆?
++    // sliding_window_enforce 鍏堟寜 turn 涓紝褰?unit_history 閲屽彧鍓?turn_id == current_turn_id
++    // 鐨?unit锛堝嵆鍙墿褰撳墠姝ｅ湪鏋勫缓銆佽繕娌℃敹灏剧殑 turn锛夋椂锛岄€€鍖栦负鎸?unit 涓€?
+     int current_turn_id = 0;
+     
+     bool async = false;
+@@ -219,59 +220,59 @@ struct omni_context {
+     volatile bool need_speek = false;
+     volatile bool speek_done = true;
+     
+-    // 预热标志：第一轮对话视为预热（例如音色克隆参考音频），完成后设为 true
++    // 棰勭儹鏍囧織锛氱涓€杞璇濊涓洪鐑紙渚嬪闊宠壊鍏嬮殕鍙傝€冮煶棰戯級锛屽畬鎴愬悗璁句负 true
+     std::atomic<bool> warmup_done{false};
+     
+-    // ==================== 双工模式状态 ====================
+-    // 当前轮次是否已结束（用于决策是否允许切换到 listen 状态）
++    // ==================== 鍙屽伐妯″紡鐘舵€?====================
++    // 褰撳墠杞鏄惁宸茬粨鏉燂紙鐢ㄤ簬鍐崇瓥鏄惁鍏佽鍒囨崲鍒?listen 鐘舵€侊級
+     // Python: self.current_turn_ended
+     bool current_turn_ended = true;
+     
+-    // 打断事件标志
+-    // break_event: 打断当前生成，但保持会话活跃（用于双工模式的用户打断）
+-    //              打断后可继续调用 prefill/decode
++    // 鎵撴柇浜嬩欢鏍囧織
++    // break_event: 鎵撴柇褰撳墠鐢熸垚锛屼絾淇濇寔浼氳瘽娲昏穬锛堢敤浜庡弻宸ユā寮忕殑鐢ㄦ埛鎵撴柇锛?
++    //              鎵撴柇鍚庡彲缁х画璋冪敤 prefill/decode
+     std::atomic<bool> break_event{false};
+     
+-    // session_stop_event: 终止整个会话（预留，目前未使用）
+-    //                     用于彻底关闭当前会话，需要重新 omni_init
++    // session_stop_event: 缁堟鏁翠釜浼氳瘽锛堥鐣欙紝鐩墠鏈娇鐢級
++    //                     鐢ㄤ簬褰诲簳鍏抽棴褰撳墠浼氳瘽锛岄渶瑕侀噸鏂?omni_init
+     std::atomic<bool> session_stop_event{false};
+     
+-    // 🔧 [双工模式] 记录当前 decode 是否以 <|listen|> 结束
+-    // 如果是，则不清理 KV cache，让下一个音频片段可以累积上下文
++    // 馃敡 [鍙屽伐妯″紡] 璁板綍褰撳墠 decode 鏄惁浠?<|listen|> 缁撴潫
++    // 濡傛灉鏄紝鍒欎笉娓呯悊 KV cache锛岃涓嬩竴涓煶棰戠墖娈靛彲浠ョ疮绉笂涓嬫枃
+     std::atomic<bool> ended_with_listen{false};
+     
+-    // [滑窗专用] 记录最近一次 decode 结果是 LISTEN 还是 SPEAK
+-    // 与 ended_with_listen 不同：不在 stream_decode 开头重置，
+-    // 只由 decode 的实际输出驱动（LISTEN→true, SPEAK→false）
++    // [婊戠獥涓撶敤] 璁板綍鏈€杩戜竴娆?decode 缁撴灉鏄?LISTEN 杩樻槸 SPEAK
++    // 涓?ended_with_listen 涓嶅悓锛氫笉鍦?stream_decode 寮€澶撮噸缃紝
++    // 鍙敱 decode 鐨勫疄闄呰緭鍑洪┍鍔紙LISTEN鈫抰rue, SPEAK鈫抐alse锛?
+     std::atomic<bool> slide_last_was_listen{true};
+     
+-    // 🔧 [与 Python 对齐] LLM 生成结束标志
+-    // 当 LLM 检测到 end token 时设置为 true
+-    // TTS 线程检查此标志来决定是否添加 text_eos_embed
++    // 馃敡 [涓?Python 瀵归綈] LLM 鐢熸垚缁撴潫鏍囧織
++    // 褰?LLM 妫€娴嬪埌 end token 鏃惰缃负 true
++    // TTS 绾跨▼妫€鏌ユ鏍囧織鏉ュ喅瀹氭槸鍚︽坊鍔?text_eos_embed
+     std::atomic<bool> llm_generation_done{false};
+     
+-    // ==================== 双工模式参数 ====================
+-    // 每个 chunk 最大生成 token 数（用于限制单次 speak 长度，便于及时响应打断）
+-    // 设置为 0 表示无限制
++    // ==================== 鍙屽伐妯″紡鍙傛暟 ====================
++    // 姣忎釜 chunk 鏈€澶х敓鎴?token 鏁帮紙鐢ㄤ簬闄愬埗鍗曟 speak 闀垮害锛屼究浜庡強鏃跺搷搴旀墦鏂級
++    // 璁剧疆涓?0 琛ㄧず鏃犻檺鍒?
+     int max_new_speak_tokens_per_chunk = 26;
+     
+-    // listen_prob_scale: 调整 <|listen|> token 的采样概率
+-    // 1.0: Python 默认
+-    float listen_prob_scale = 1.0f;
++    // listen_prob_scale: adjust <|listen|> sampling. Values below 1.0 make
++    // local duplex more willing to speak after user audio instead of staying silent.
++    float listen_prob_scale = 0.65f;
+ 
+-    // 会话开局强制 LISTEN 的 chunk 数（与 Python duplex_config.force_listen_count 对齐）
+-    // 防止 browser 打开 MediaStreamTrack 时的瞬态噪声 + 强 system prompt 组合
+-    // 导致模型在第一 chunk 就 SPEAK 产生"抢答"。
+-    // 每次 update_session_config 时重置 force_listen_used=0。
+-    int force_listen_count = 3;
++    // 浼氳瘽寮€灞€寮哄埗 LISTEN 鐨?chunk 鏁帮紙涓?Python duplex_config.force_listen_count 瀵归綈锛?
++    // 闃叉 browser 鎵撳紑 MediaStreamTrack 鏃剁殑鐬€佸櫔澹?+ 寮?system prompt 缁勫悎
++    // 瀵艰嚧妯″瀷鍦ㄧ涓€ chunk 灏?SPEAK 浜х敓"鎶㈢瓟"銆?
++    // 姣忔 update_session_config 鏃堕噸缃?force_listen_used=0銆?
++    int force_listen_count = 1;
+     int force_listen_used  = 0;
+     
+-    // 是否启用双工模式
+-    // simplex: 单工模式，用户说完后模型回复，回复完用户再说
+-    // duplex: 双工模式，模型可以在任意时刻决定听/说切换
++    // 鏄惁鍚敤鍙屽伐妯″紡
++    // simplex: 鍗曞伐妯″紡锛岀敤鎴疯瀹屽悗妯″瀷鍥炲锛屽洖澶嶅畬鐢ㄦ埛鍐嶈
++    // duplex: 鍙屽伐妯″紡锛屾ā鍨嬪彲浠ュ湪浠绘剰鏃跺埢鍐冲畾鍚?璇村垏鎹?
+     bool duplex_mode = false;
+     
+-    // 系统 prompt 是否已初始化（防止 stream_prefill index=0 被重复调用导致 prompt 重复）
++    // 绯荤粺 prompt 鏄惁宸插垵濮嬪寲锛堥槻姝?stream_prefill index=0 琚噸澶嶈皟鐢ㄥ鑷?prompt 閲嶅锛?
+     bool system_prompt_initialized = false;
+     
+     class AudioInputManager * audio_input_manager = NULL;
+@@ -279,23 +280,23 @@ struct omni_context {
+     // models path and other configs
+     struct common_params * params = NULL;
+     
+-    // 当前是以「语音通话」还是「视频通话」模式进入的，0 = 语音，1 = 视频；
++    // 褰撳墠鏄互銆岃闊抽€氳瘽銆嶈繕鏄€岃棰戦€氳瘽銆嶆ā寮忚繘鍏ョ殑锛? = 璇煶锛? = 瑙嗛锛?
+     int media_type = 0;
+     int use_tts = false;
+     std::string tts_bin_dir = "";
+-    std::string ref_audio_path = "";  // 参考音频路径（用于音色克隆）
++    std::string ref_audio_path = "";  // 鍙傝€冮煶棰戣矾寰勶紙鐢ㄤ簬闊宠壊鍏嬮殕锛?
+     
+-    // 🔧 [高清/高刷模式] 
+-    // high_image: 高清模式，max_slice_nums 设置为 2，vision 可以看到更多细节
+-    // high_refresh: 高刷模式，1秒5帧，第1帧作为主图，后4帧stack合并成一张图
+-    //               注意：stack 处理在 Python server 层实现，C++ 只是标记
++    // 馃敡 [楂樻竻/楂樺埛妯″紡] 
++    // high_image: 楂樻竻妯″紡锛宮ax_slice_nums 璁剧疆涓?2锛寁ision 鍙互鐪嬪埌鏇村缁嗚妭
++    // high_refresh: 楂樺埛妯″紡锛?绉?甯э紝绗?甯т綔涓轰富鍥撅紝鍚?甯tack鍚堝苟鎴愪竴寮犲浘
++    //               娉ㄦ剰锛歴tack 澶勭悊鍦?Python server 灞傚疄鐜帮紝C++ 鍙槸鏍囪
+     bool high_image = false;
+     bool high_refresh = false;
+     
+-    // 🔧 [多实例支持] 可配置的输出目录，避免多个服务实例冲突
++    // 馃敡 [澶氬疄渚嬫敮鎸乚 鍙厤缃殑杈撳嚭鐩綍锛岄伩鍏嶅涓湇鍔″疄渚嬪啿绐?
+     std::string base_output_dir = "./tools/omni/output";
+     
+-    // 每次会话，是否清除 kv cache（默认开启自动清理 kv cache）
++    // 姣忔浼氳瘽锛屾槸鍚︽竻闄?kv cache锛堥粯璁ゅ紑鍚嚜鍔ㄦ竻鐞?kv cache锛?
+     bool clean_kvcache = true;
+     
+     std::string omni_voice_clone_prompt = "";
+@@ -303,7 +304,7 @@ struct omni_context {
+     std::string audio_voice_clone_prompt = "";
+     std::string audio_assistant_prompt = "";
+     
+-    // 语言设置 (用于 prompt 生成)
++    // 璇█璁剧疆 (鐢ㄤ簬 prompt 鐢熸垚)
+     std::string language = "zh";
+ 
+     // text streaming queue for server
+@@ -313,7 +314,7 @@ struct omni_context {
+     bool text_streaming = false;
+     bool text_done_flag = false;
+ 
+-    // llama inference mutex - 保护 ctx_llama 的推理操作
++    // llama inference mutex - 淇濇姢 ctx_llama 鐨勬帹鐞嗘搷浣?
+     std::mutex llama_mtx;
+     
+     // TTS weights loaded from GGUF file
+@@ -337,7 +338,7 @@ struct omni_context {
+     int projector_semantic_input_dim = 0;  // 4096
+     int projector_semantic_output_dim = 0;  // 768
+     
+-    // New ggml-based projector model (精度验证版本)
++    // New ggml-based projector model (绮惧害楠岃瘉鐗堟湰)
+     struct projector_model projector;
+     
+     // head_code: Linear layer (hidden_size=768 -> num_audio_tokens=6562)
+@@ -354,18 +355,18 @@ struct omni_context {
+     int tts_condition_n_embd = 0;  // Embedding dimension (768)
+     bool tts_condition_saved = false;  // Whether condition has been saved
+     
+-    // 🔧 TTS KV cache 累计位置（用于保持跨 chunk 的上下文连续性）
+-    // Python TTSStreamingGenerator 使用 text_start_pos 来跟踪位置
++    // 馃敡 TTS KV cache 绱浣嶇疆锛堢敤浜庝繚鎸佽法 chunk 鐨勪笂涓嬫枃杩炵画鎬э級
++    // Python TTSStreamingGenerator 浣跨敤 text_start_pos 鏉ヨ窡韪綅缃?
+     int tts_n_past_accumulated = 0;
+     
+-    // 🔧 [关键修复] TTS 已生成的所有 audio tokens（跨 chunk 累积）
+-    // Python: self.all_generated_tokens 是类成员变量，跨 chunk 持续累积
+-    // 用于：1. RAS 重复检测（需要完整历史）2. 正确判断 audio_bos（只有第一个 token 才是）
++    // 馃敡 [鍏抽敭淇] TTS 宸茬敓鎴愮殑鎵€鏈?audio tokens锛堣法 chunk 绱Н锛?
++    // Python: self.all_generated_tokens 鏄被鎴愬憳鍙橀噺锛岃法 chunk 鎸佺画绱Н
++    // 鐢ㄤ簬锛?. RAS 閲嶅妫€娴嬶紙闇€瑕佸畬鏁村巻鍙诧級2. 姝ｇ‘鍒ゆ柇 audio_bos锛堝彧鏈夌涓€涓?token 鎵嶆槸锛?
+     std::vector<llama_token> tts_all_generated_tokens;
+     
+-    // 🔧 [与 Python 对齐] TTS audio token buffer（跨 text chunk 累积）
+-    // Python: self._token_buffer 是类成员变量，用于累积 audio token
+-    // 只有满足 chunk_size (25) 才会 yield，不足的保留到下一个 text chunk
++    // 馃敡 [涓?Python 瀵归綈] TTS audio token buffer锛堣法 text chunk 绱Н锛?
++    // Python: self._token_buffer 鏄被鎴愬憳鍙橀噺锛岀敤浜庣疮绉?audio token
++    // 鍙湁婊¤冻 chunk_size (25) 鎵嶄細 yield锛屼笉瓒崇殑淇濈暀鍒颁笅涓€涓?text chunk
+     std::vector<int32_t> tts_token_buffer;
+     
+     // Timestamp for stream_decode start (used for WAV file naming)
+@@ -376,48 +377,48 @@ struct omni_context {
+     bool token2wav_initialized = false;
+     std::string token2wav_model_dir;  // Directory containing token2wav GGUF models
+     
+-    // 🔧 [Python Token2Wav] 使用 Python stepaudio2 库实现的 Token2Wav
+-    // 设置为 true 时使用 Python 实现（精度更高），false 时使用 C++ 实现
+-    // macOS 上默认使用 C++ 实现（无 CUDA）
++    // 馃敡 [Python Token2Wav] 浣跨敤 Python stepaudio2 搴撳疄鐜扮殑 Token2Wav
++    // 璁剧疆涓?true 鏃朵娇鐢?Python 瀹炵幇锛堢簿搴︽洿楂橈級锛宖alse 鏃朵娇鐢?C++ 瀹炵幇
++    // macOS 涓婇粯璁や娇鐢?C++ 瀹炵幇锛堟棤 CUDA锛?
+     bool use_python_token2wav = false;
+-    std::string python_t2w_script_dir;  // Python Token2Wav 脚本目录
+-    std::string python_t2w_model_dir;   // Python Token2Wav 模型目录
++    std::string python_t2w_script_dir;  // Python Token2Wav 鑴氭湰鐩綍
++    std::string python_t2w_model_dir;   // Python Token2Wav 妯″瀷鐩綍
+     
+-    // Python Token2Wav 服务进程 (通过 popen 启动)
+-    FILE* python_t2w_stdin = nullptr;   // 写入命令
+-    FILE* python_t2w_stdout = nullptr;  // 读取响应
+-    pid_t python_t2w_pid = -1;          // 进程 ID
++    // Python Token2Wav 鏈嶅姟杩涚▼ (閫氳繃 popen 鍚姩)
++    FILE* python_t2w_stdin = nullptr;   // 鍐欏叆鍛戒护
++    FILE* python_t2w_stdout = nullptr;  // 璇诲彇鍝嶅簲
++    pid_t python_t2w_pid = -1;          // 杩涚▼ ID
+     bool python_t2w_initialized = false;
+-    std::string python_t2w_gpu_id;      // GPU ID (如 "0", "1")
++    std::string python_t2w_gpu_id;      // GPU ID (濡?"0", "1")
+     
+-    // 🔧 Python T2W 独立 GPU 配置
+-    // C++ LLM+TTS 占用约 22GB，Python T2W 占用约 3.3GB
+-    // 单卡 24GB 放不下，需要使用独立 GPU
+-    // 设置为空字符串表示使用与 C++ 相同的 GPU
+-    std::string python_t2w_dedicated_gpu = "";  // 独立 GPU ID，如 "1"
++    // 馃敡 Python T2W 鐙珛 GPU 閰嶇疆
++    // C++ LLM+TTS 鍗犵敤绾?22GB锛孭ython T2W 鍗犵敤绾?3.3GB
++    // 鍗曞崱 24GB 鏀句笉涓嬶紝闇€瑕佷娇鐢ㄧ嫭绔?GPU
++    // 璁剧疆涓虹┖瀛楃涓茶〃绀轰娇鐢ㄤ笌 C++ 鐩稿悓鐨?GPU
++    std::string python_t2w_dedicated_gpu = "";  // 鐙珛 GPU ID锛屽 "1"
+     
+-    // Token2Wav sliding window buffer (跨 chunk 保持状态)
+-    // Python 逻辑: buffer 初始填充 3 个静音 token (4218)
+-    // 每次取 28 个 tokens (25 main + 3 lookahead)，处理后移动 25 个，保留 3 个重叠
++    // Token2Wav sliding window buffer (璺?chunk 淇濇寔鐘舵€?
++    // Python 閫昏緫: buffer 鍒濆濉厖 3 涓潤闊?token (4218)
++    // 姣忔鍙?28 涓?tokens (25 main + 3 lookahead)锛屽鐞嗗悗绉诲姩 25 涓紝淇濈暀 3 涓噸鍙?
+     std::vector<int32_t> token2wav_buffer;
+-    int token2wav_wav_idx = 0;  // 输出 WAV 文件计数器
+-    int wav_turn_base = 0;      // 每轮对话结束时 +1000，用于区分不同轮次的 WAV 文件
++    int token2wav_wav_idx = 0;  // 杈撳嚭 WAV 鏂囦欢璁℃暟鍣?
++    int wav_turn_base = 0;      // 姣忚疆瀵硅瘽缁撴潫鏃?+1000锛岀敤浜庡尯鍒嗕笉鍚岃疆娆＄殑 WAV 鏂囦欢
+     
+-    // 🔧 [单工模式] 当前轮次索引（用于创建 round_000、round_001 等子目录）
++    // 馃敡 [鍗曞伐妯″紡] 褰撳墠杞绱㈠紩锛堢敤浜庡垱寤?round_000銆乺ound_001 绛夊瓙鐩綍锛?
+     int simplex_round_idx = 0;
+     
+-    // ==================== 特殊 Token ID ====================
+-    // 在 omni_init 时从词表查找并缓存
+-    llama_token special_token_speak = -1;        // <|speak|>: 模型开始说话
+-    llama_token special_token_listen = -1;       // <|listen|>: 模型开始听（双工）
+-    llama_token special_token_chunk_eos = -1;    // <|chunk_eos|>: 语义 chunk 结束
+-    llama_token special_token_chunk_tts_eos = -1;// <|chunk_tts_eos|>: TTS chunk 结束
+-    llama_token special_token_turn_eos = -1;     // <|turn_eos|>: 轮次结束
+-    llama_token special_token_tts_eos = -1;      // <|tts_eos|>: 旧版 TTS 结束
+-    llama_token special_token_eos = -1;          // </s>: 序列结束
+-    llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 开始（用于双工强制继续说话）
+-    llama_token special_token_unit_end = -1;     // </unit>: unit 结束标记（双工 chunk 边界）
+-    llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 填充（双工模式下禁止采样）
++    // ==================== 鐗规畩 Token ID ====================
++    // 鍦?omni_init 鏃朵粠璇嶈〃鏌ユ壘骞剁紦瀛?
++    llama_token special_token_speak = -1;        // <|speak|>: 妯″瀷寮€濮嬭璇?
++    llama_token special_token_listen = -1;       // <|listen|>: 妯″瀷寮€濮嬪惉锛堝弻宸ワ級
++    llama_token special_token_chunk_eos = -1;    // <|chunk_eos|>: 璇箟 chunk 缁撴潫
++    llama_token special_token_chunk_tts_eos = -1;// <|chunk_tts_eos|>: TTS chunk 缁撴潫
++    llama_token special_token_turn_eos = -1;     // <|turn_eos|>: 杞缁撴潫
++    llama_token special_token_tts_eos = -1;      // <|tts_eos|>: 鏃х増 TTS 缁撴潫
++    llama_token special_token_eos = -1;          // </s>: 搴忓垪缁撴潫
++    llama_token tts_bos_token_id = -1;           // <|tts_bos|>: TTS 寮€濮嬶紙鐢ㄤ簬鍙屽伐寮哄埗缁х画璇磋瘽锛?
++    llama_token special_token_unit_end = -1;     // </unit>: unit 缁撴潫鏍囪锛堝弻宸?chunk 杈圭晫锛?
++    llama_token special_token_tts_pad = -1;      // <|tts_pad|>: TTS 濉厖锛堝弻宸ユā寮忎笅绂佹閲囨牱锛?
+ };
+ 
+ //
+@@ -443,56 +444,57 @@ struct omni_context * omni_init(struct common_params * params, int media_type, b
+ 
+ void omni_free(struct omni_context * ctx_omni);
+ 
+-// ANE/CoreML warmup — call once after omni_init to pre-load models into NPU
++// ANE/CoreML warmup 鈥?call once after omni_init to pre-load models into NPU
+ void omni_warmup_ane(struct omni_context * ctx_omni);
+ 
+-// 检查 TTS 和 T2W 队列是否都为空
++// 妫€鏌?TTS 鍜?T2W 闃熷垪鏄惁閮戒负绌?
+ bool omni_tts_queues_empty(struct omni_context * ctx_omni);
+ 
+-// 停止所有线程（在 join 之前调用）
++// 鍋滄鎵€鏈夌嚎绋嬶紙鍦?join 涔嬪墠璋冪敤锛?
+ void omni_stop_threads(struct omni_context * ctx_omni);
+ 
+ bool stream_prefill(struct omni_context * ctx_omni,
+                             std::string aud_fname,
+                             std::string img_fname = "",
+                             int index = 0,
+-                            int max_slice_nums = -1);  // -1 表示使用全局设置，>=1 表示本次 prefill 的 slice 数量
++                            int max_slice_nums = -1,
++                            std::string user_prompt = "");
+ 
+ bool stream_decode(struct omni_context * ctx_omni,
+                         std::string debug_dir,
+-                        int round_idx = -1);  // round_idx: 由调用方指定的轮次索引，-1 表示使用内部计数
++                        int round_idx = -1);  // round_idx: 鐢辫皟鐢ㄦ柟鎸囧畾鐨勮疆娆＄储寮曪紝-1 琛ㄧず浣跨敤鍐呴儴璁℃暟
+ 
+ bool stop_speek(struct omni_context * ctx_omni);
+ 
+ bool clean_kvcache(struct omni_context * ctx_omni);
+ 
+-// TTS 推理函数声明（用于 test_tts_inference.cpp）
++// TTS 鎺ㄧ悊鍑芥暟澹版槑锛堢敤浜?test_tts_inference.cpp锛?
+ bool load_tts_weights_from_gguf(struct omni_context * ctx_omni, const char * tts_model_path);
+ bool prefill_with_emb_tts(struct omni_context* ctx_omni, common_params* params, float* embed, int n_pos, int n_batch, int* n_past_tts);
+-// sample_tts_token 参数说明：
+-// - all_generated_tokens: 跨 chunk 累积的所有 tokens（用于判断是否是整个过程的第一个 token，即 re-forward condition）
+-// - chunk_generated_tokens: 当前 chunk 内已生成的 tokens（用于 repetition penalty，与 Python generate_chunk 对齐）
+-// - token_index_in_chunk: 当前 chunk 内的 token 索引（用于判断是否跳过 sampling processors）
+-// - force_no_eos: 是否强制阻止 EOS token 被采样（用于 min_new_tokens 逻辑，与 Python generate_chunk 对齐）
++// sample_tts_token 鍙傛暟璇存槑锛?
++// - all_generated_tokens: 璺?chunk 绱Н鐨勬墍鏈?tokens锛堢敤浜庡垽鏂槸鍚︽槸鏁翠釜杩囩▼鐨勭涓€涓?token锛屽嵆 re-forward condition锛?
++// - chunk_generated_tokens: 褰撳墠 chunk 鍐呭凡鐢熸垚鐨?tokens锛堢敤浜?repetition penalty锛屼笌 Python generate_chunk 瀵归綈锛?
++// - token_index_in_chunk: 褰撳墠 chunk 鍐呯殑 token 绱㈠紩锛堢敤浜庡垽鏂槸鍚﹁烦杩?sampling processors锛?
++// - force_no_eos: 鏄惁寮哄埗闃绘 EOS token 琚噰鏍凤紙鐢ㄤ簬 min_new_tokens 閫昏緫锛屼笌 Python generate_chunk 瀵归綈锛?
+ llama_token sample_tts_token(struct common_sampler * smpl, struct omni_context * ctx_omni, common_params* params, int * n_past_tts, const std::vector<llama_token> * all_generated_tokens = nullptr, const std::vector<llama_token> * chunk_generated_tokens = nullptr, int token_index_in_chunk = 0, bool force_no_eos = false);
+ 
+-// Projector 函数声明（精度验证版本）
++// Projector 鍑芥暟澹版槑锛堢簿搴﹂獙璇佺増鏈級
+ bool projector_init(projector_model & model, const std::string & fname, bool use_cuda);
+ void projector_free(projector_model & model);
+ std::vector<float> projector_forward(projector_model & model, const float * input_data, int n_tokens);
+ 
+-// ==================== 滑动窗口函数声明 (#39) ====================
+-// Unit 管理
++// ==================== 婊戝姩绐楀彛鍑芥暟澹版槑 (#39) ====================
++// Unit 绠＄悊
+ int sliding_window_register_unit_start(struct omni_context * ctx_omni);
+ void sliding_window_register_unit_end(struct omni_context * ctx_omni, const std::string & input_type, 
+                                       const std::vector<llama_token> & generated_tokens = {}, bool is_listen = false);
+ void sliding_window_register_system_prompt(struct omni_context * ctx_omni);
+ 
+-// 滑窗执行
++// 婊戠獥鎵ц
+ bool sliding_window_enforce(struct omni_context * ctx_omni);
+ bool sliding_window_drop_tokens_from_cache(struct omni_context * ctx_omni, int length);
+ void sliding_window_reset(struct omni_context * ctx_omni);
+ 
+-// ==================== 高清模式函数声明 ====================
+-// 设置 vision max_slice_nums 覆盖值，用于高清模式
+-void vision_set_max_slice_nums(struct vision_ctx * ctx_vision, int max_slice_nums);
+\ No newline at end of file
++// ==================== 楂樻竻妯″紡鍑芥暟澹版槑 ====================
++// 璁剧疆 vision max_slice_nums 瑕嗙洊鍊硷紝鐢ㄤ簬楂樻竻妯″紡
++void vision_set_max_slice_nums(struct vision_ctx * ctx_vision, int max_slice_nums);
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index f288bf3..3a10435 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -5587,6 +5587,7 @@ int main(int argc, char ** argv) {
+         // 🔧 [高清+高刷] 可选参数：控制本次 prefill 的图片切片数量
+         // -1 (默认) = 使用全局设置, 1 = 不切片, 2 = 高清模式切片
+         const int max_slice_nums             = data.value("max_slice_nums", -1);
++        const std::string user_prompt        = data.value("prompt", "");
+ 
+         bool ok = true;
+ 
+@@ -5599,7 +5600,7 @@ int main(int argc, char ** argv) {
+         // }
+         std::string img_fname = img_path_prefix;
+         std::lock_guard<std::mutex> lock(ctx_server.octx_mutex);
+-        if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums)) {
++        if (!stream_prefill(ctx_server.octx, aud_fname, img_fname, cnt, max_slice_nums, user_prompt)) {
+             ok = false;
+             // break;
+         }
+@@ -5615,7 +5616,8 @@ int main(int argc, char ** argv) {
+             {"audio_path_prefix", data.at("audio_path_prefix")},
+             {"img_path_prefix", data.contains("img_path_prefix") ? data.at("img_path_prefix") : json("")},
+             {"img_posfix", data.contains("img_posfix") ? data.at("img_posfix") : json("")},
+-            {"cnt", data.at("cnt")}
++            {"cnt", data.at("cnt")},
++            {"prompt_chars", user_prompt.size()}
+         };
+         res_ok(res, ack);
+     };
+@@ -5774,6 +5776,7 @@ int main(int argc, char ** argv) {
+             return;
+         }
+         bool use_tts = json_value(data, "use_tts", true);
++        bool use_audio = json_value(data, "use_audio", true);
+         bool duplex_mode = json_value(data, "duplex_mode", false);
+         
+         // 模型目录配置
+@@ -5799,7 +5802,7 @@ int main(int argc, char ** argv) {
+         }
+         // 🔧 [修复] 使用正确的模型文件名格式 (MiniCPM-o-4_5)
+         params.vpm_model = model_dir_normalized + "vision/MiniCPM-o-4_5-vision-F16.gguf";
+-        params.apm_model = model_dir_normalized + "audio/MiniCPM-o-4_5-audio-F16.gguf";
++        params.apm_model = use_audio ? model_dir_normalized + "audio/MiniCPM-o-4_5-audio-F16.gguf" : "";
+         params.tts_model = model_dir_normalized + "tts/MiniCPM-o-4_5-tts-F16.gguf";
+         // LLM 模型路径由 llama-server 启动时的 --model 参数指定，这里不需要设置
+         // params.model.path 已经由 ctx_server.model 提供
+@@ -5828,7 +5831,7 @@ int main(int argc, char ** argv) {
+                 }
+                 return true;
+             };
+-            if (!check_model_file("apm", params.apm_model)) {
++            if (use_audio && !check_model_file("apm", params.apm_model)) {
+                 return;
+             }
+             if (use_tts && !params.tts_model.empty()) {
+@@ -5894,6 +5897,7 @@ int main(int argc, char ** argv) {
+             {"success", true},
+             {"media_type", media_type},
+             {"use_tts", use_tts},
++            {"use_audio", use_audio},
+             {"voice_audio_used", data.contains("voice_audio") && data.at("voice_audio").is_string() && !data.at("voice_audio").get<std::string>().empty()}
+         };
+         res_ok(res, ack);

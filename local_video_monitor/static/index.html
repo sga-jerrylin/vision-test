@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniCPM-o 本机视频监控</title>
+  <style>
+    :root {
+      --bg: #edf1e8;
+      --ink: #142018;
+      --muted: #627064;
+      --card: rgba(255, 252, 242, 0.88);
+      --line: rgba(20, 32, 24, 0.12);
+      --green: #18a058;
+      --blue: #2168f3;
+      --amber: #c98412;
+      --red: #d33d2e;
+      --shadow: 0 24px 70px rgba(52, 65, 45, 0.18);
+      --radius: 28px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      background:
+        radial-gradient(circle at 12% 8%, rgba(24, 160, 88, 0.20), transparent 28vw),
+        radial-gradient(circle at 92% 16%, rgba(33, 104, 243, 0.16), transparent 24vw),
+        linear-gradient(135deg, #f5f2e8 0%, var(--bg) 58%, #dfe8dd 100%);
+    }
+
+    .shell {
+      width: min(1280px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .mark {
+      width: 48px;
+      height: 48px;
+      border-radius: 16px;
+      display: grid;
+      place-items: center;
+      color: white;
+      font-weight: 900;
+      letter-spacing: -0.08em;
+      background: linear-gradient(135deg, #1f7a42, #44c1a2 52%, #326bff);
+      box-shadow: 0 14px 38px rgba(31, 122, 66, 0.28);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(25px, 3vw, 42px);
+      letter-spacing: -0.04em;
+      line-height: 1.05;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      margin-top: 6px;
+      font-size: 14px;
+    }
+
+    .pill {
+      padding: 11px 15px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.56);
+      color: var(--muted);
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.75fr);
+      gap: 22px;
+      align-items: start;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--card);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      backdrop-filter: blur(18px);
+    }
+
+    .video-wrap {
+      position: relative;
+      min-height: 360px;
+      background: #121711;
+      display: grid;
+      place-items: center;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      min-height: 360px;
+      max-height: 82vh;
+      object-fit: cover;
+      background: #121711;
+    }
+
+    #preview {
+      display: none;
+      width: 100%;
+      min-height: 360px;
+      max-height: 82vh;
+      object-fit: cover;
+      background: #121711;
+      position: relative;
+      z-index: 1;
+    }
+
+    .multi-grid {
+      display: none;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 3px;
+      width: 100%;
+      position: relative;
+      z-index: 2;
+    }
+
+    .multi-cell {
+      background: #0a0f0a;
+      overflow: hidden;
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%;
+    }
+
+    .multi-cell img {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      background: #0a0f0a;
+    }
+
+    .empty {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.78);
+      padding: 30px;
+      pointer-events: none;
+    }
+
+    .empty strong {
+      display: block;
+      font-size: 28px;
+      margin-bottom: 10px;
+      color: white;
+    }
+
+    .heads-up {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      padding: 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.12);
+      background: rgba(18, 23, 17, 0.92);
+      color: white;
+    }
+
+    .meter {
+      min-width: 136px;
+      padding: 11px 13px;
+      border-radius: 17px;
+      background: rgba(255, 255, 255, 0.09);
+      border: 1px solid rgba(255, 255, 255, 0.11);
+    }
+
+    .meter span {
+      display: block;
+      color: rgba(255, 255, 255, 0.62);
+      font-size: 12px;
+      margin-bottom: 4px;
+    }
+
+    .meter b {
+      font-size: 18px;
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 800;
+      margin-bottom: 8px;
+    }
+
+    textarea,
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 14px 15px;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.78);
+      outline: none;
+      font: inherit;
+      transition: border-color 0.18s, box-shadow 0.18s, background 0.18s;
+    }
+
+    textarea {
+      min-height: 108px;
+      resize: vertical;
+      line-height: 1.55;
+    }
+
+    textarea:focus,
+    input:focus {
+      border-color: rgba(24, 160, 88, 0.65);
+      box-shadow: 0 0 0 4px rgba(24, 160, 88, 0.12);
+      background: white;
+    }
+
+    .field {
+      margin-bottom: 17px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 14px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.55);
+      color: var(--muted);
+      font-weight: 700;
+      margin-bottom: 18px;
+    }
+
+    .check input {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--green);
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 18px;
+      padding: 14px 16px;
+      cursor: pointer;
+      color: white;
+      font: inherit;
+      font-weight: 900;
+      letter-spacing: 0.02em;
+      transition: transform 0.16s, filter 0.16s, opacity 0.16s;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: saturate(1.08);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.5;
+      transform: none;
+    }
+
+    .primary {
+      background: linear-gradient(135deg, var(--green), #34bfa3);
+    }
+
+    .secondary {
+      background: linear-gradient(135deg, #314456, var(--blue));
+    }
+
+    .danger {
+      background: linear-gradient(135deg, #7d342d, var(--red));
+    }
+
+    .ghost {
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid var(--line);
+    }
+
+    .log-card {
+      margin-top: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      background: rgba(255, 255, 255, 0.48);
+    }
+
+    .log-title {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-weight: 900;
+    }
+
+    #log {
+      height: 230px;
+      overflow: auto;
+      padding-right: 6px;
+      font-size: 13px;
+      line-height: 1.55;
+      color: #283529;
+    }
+
+    .entry {
+      padding: 9px 0;
+      border-bottom: 1px dashed rgba(20, 32, 24, 0.14);
+    }
+
+    .entry small {
+      color: var(--muted);
+      margin-right: 8px;
+    }
+
+    .entry.event {
+      color: #0b6937;
+      font-weight: 800;
+    }
+
+    .entry.error {
+      color: var(--red);
+      font-weight: 800;
+    }
+
+    @media (max-width: 920px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .video-wrap,
+      video {
+        min-height: 360px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <div class="brand">
+        <div class="mark">M</div>
+        <div>
+          <h1>本机视频监控</h1>
+          <div class="subtitle">MiniCPM-o 4.5 video-only direct path. No LiveKit, no ASR, no TTS.</div>
+        </div>
+      </div>
+      <div class="pill" id="statusPill">未启动</div>
+    </header>
+
+    <main class="layout">
+      <section class="card">
+        <div class="video-wrap" id="videoWrap">
+          <video id="video" autoplay playsinline muted></video>
+          <img id="preview" alt="RTSP preview" />
+          <div class="multi-grid" id="multiGrid" style="display:none">
+             <div class="multi-cell"></div>
+             <div class="multi-cell"></div>
+             <div class="multi-cell"></div>
+           </div>
+          <div class="empty" id="empty">
+            <div>
+              <strong>摄像头待启动</strong>
+              <div>点击右侧“开始监控”，浏览器会请求摄像头权限。</div>
+            </div>
+          </div>
+        </div>
+        <div class="heads-up">
+          <div class="meter"><span>推理帧</span><b id="frames">0</b></div>
+          <div class="meter"><span>跳过帧</span><b id="skipped">0</b></div>
+          <div class="meter"><span>通知数</span><b id="events">0</b></div>
+          <div class="meter"><span>状态</span><b id="busy">idle</b></div>
+        </div>
+      </section>
+
+      <aside class="card panel">
+        <div class="field">
+          <label for="rule">监控要求</label>
+          <textarea id="rule">有人出现就通知我，然后告诉我是男是女，还有穿什么衣服、明显特征和移动方向。</textarea>
+        </div>
+
+        <div class="field">
+          <label for="webhook">企业微信 Webhook（已预填）</label>
+          <input id="webhook" type="text" autocomplete="off" value="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=26bc9425-d542-4f90-890d-cb8e23bb1666" placeholder="Enterprise WeChat robot webhook URL" />
+        </div>
+
+        <div class="field">
+          <label for="rtspUrl">摄像头选择</label>
+          <select id="rtspUrl">
+            <option value="rtsp://192.168.10.11:554/user=admin&password=&channel=1&stream=0.sdp?">CAM01 - 192.168.10.11</option>
+            <option value="rtsp://admin:123456@192.168.10.200:554/h264/ch1/main/av_stream">IP Camera - 192.168.10.200</option>
+            <option value="rtsp://admin:123456@192.168.10.221:554/h264/ch1/main/av_stream">IP Camera - 192.168.10.221</option>
+            <option value="multi">全部摄像头 (3路同时)</option>
+          </select>
+        </div>
+
+        <div class="grid">
+          <div class="field">
+            <label for="captureMs">采样间隔 ms</label>
+            <input id="captureMs" type="number" min="300" max="5000" step="100" value="900" />
+          </div>
+          <div class="field">
+            <label for="generateSec">推理间隔 s</label>
+            <input id="generateSec" type="number" min="0.2" max="10" step="0.1" value="0.9" />
+          </div>
+        </div>
+
+        <div class="grid">
+          <div class="field">
+            <label for="jpegQuality">JPEG 质量</label>
+            <input id="jpegQuality" type="number" min="0.35" max="0.95" step="0.05" value="0.72" />
+          </div>
+          <div class="field">
+            <label for="cooldownSec">通知冷却 s</label>
+            <input id="cooldownSec" type="number" min="0" max="3600" step="1" value="12" />
+          </div>
+        </div>
+
+        <label class="check">
+          <input id="highQuality" type="checkbox" />
+          高清切片，画质更好但更吃算力
+        </label>
+
+        <div class="buttons">
+          <button class="primary" id="startBtn">开始监控</button>
+          <button class="danger" id="stopBtn" disabled>停止</button>
+          <button class="secondary" id="testBtn">测试通知</button>
+          <button class="ghost" id="clearBtn">清日志</button>
+        </div>
+
+        <div class="log-card">
+          <div class="log-title">
+            <span>运行日志</span>
+            <span id="lastText">等待中</span>
+          </div>
+          <div id="log"></div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <canvas id="canvas" hidden></canvas>
+
+  <script>
+    const video = document.getElementById("video");
+    const preview = document.getElementById("preview");
+    const multiGrid = document.getElementById("multiGrid");
+    const canvas = document.getElementById("canvas");
+    const empty = document.getElementById("empty");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const testBtn = document.getElementById("testBtn");
+    const clearBtn = document.getElementById("clearBtn");
+    const statusPill = document.getElementById("statusPill");
+    const logEl = document.getElementById("log");
+    const lastText = document.getElementById("lastText");
+    const framesEl = document.getElementById("frames");
+    const skippedEl = document.getElementById("skipped");
+    const eventsEl = document.getElementById("events");
+    const busyEl = document.getElementById("busy");
+
+    let stream = null;
+    let running = false;
+    let loopTimer = null;
+    let frameInFlight = false;
+
+    function value(id) {
+      return document.getElementById(id).value.trim();
+    }
+
+    function numberValue(id, fallback) {
+      const n = Number(value(id));
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function log(message, type = "") {
+      const row = document.createElement("div");
+      row.className = `entry ${type}`.trim();
+      const now = new Date().toLocaleTimeString();
+      row.innerHTML = `<small>${now}</small>${message}`;
+      logEl.prepend(row);
+      while (logEl.children.length > 80) {
+        logEl.removeChild(logEl.lastChild);
+      }
+    }
+
+    const RTSP_URLS = [
+      "rtsp://192.168.10.11:554/user=admin&password=&channel=1&stream=0.sdp?",
+      "rtsp://admin:123456@192.168.10.200:554/h264/ch1/main/av_stream",
+      "rtsp://admin:123456@192.168.10.221:554/h264/ch1/main/av_stream",
+    ];
+    const CAM_LABELS = ["CAM01 (192.168.10.11)", "IP Camera (192.168.10.200)", "IP Camera (192.168.10.221)"];
+
+    function switchPreview(rtspUrl) {
+      if (!rtspUrl) return;
+      if (rtspUrl === "multi") {
+        reloadMultiGrid();
+        log("预览切换：全部摄像头 (3路)");
+        return;
+      }
+      video.style.display = "none";
+      multiGrid.style.display = "none";
+      var p = document.getElementById("preview");
+      p.style.display = "block";
+      p.style.objectFit = "cover";
+      p.src = "/api/preview?url=" + encodeURIComponent(rtspUrl);
+      empty.style.display = "none";
+      log("预览切换：" + rtspUrl.substring(0, 50) + "...");
+    }
+
+    function reloadMultiGrid() {
+      video.style.display = "none";
+      var p = document.getElementById("preview");
+      p.style.display = "none";
+      p.src = "";
+      multiGrid.style.display = "grid";
+      empty.style.display = "none";
+      for (var i = 0; i < 3; i++) {
+        var cell = multiGrid.children[i];
+        var old = cell.querySelector("img");
+        if (old) { old.src = ""; cell.removeChild(old); }
+        var img = document.createElement("img");
+        img.alt = CAM_LABELS[i];
+        img.src = running ? "/api/preview_cap/" + i : "/api/preview?url=" + encodeURIComponent(RTSP_URLS[i]);
+        cell.appendChild(img);
+      }
+    }
+
+    async function postJson(url, body) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || {}),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(data.detail || response.statusText);
+      }
+      return data;
+    }
+
+    async function ensureCamera() {
+      if (stream) {
+        return;
+      }
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 24, max: 30 },
+        },
+        audio: false,
+      });
+      video.srcObject = stream;
+      await video.play();
+      empty.style.display = "none";
+    }
+
+    function captureFrame() {
+      const vw = video.videoWidth || 1280;
+      const vh = video.videoHeight || 720;
+      const maxWidth = 768;
+      const scale = Math.min(1, maxWidth / vw);
+      canvas.width = Math.round(vw * scale);
+      canvas.height = Math.round(vh * scale);
+      const ctx = canvas.getContext("2d", { alpha: false });
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const quality = Math.max(0.35, Math.min(0.95, numberValue("jpegQuality", 0.72)));
+      return canvas.toDataURL("image/jpeg", quality);
+    }
+
+    async function pushFrame() {
+      if (!running || frameInFlight || video.readyState < 2) {
+        return;
+      }
+      frameInFlight = true;
+      try {
+        const image = captureFrame();
+        const data = await postJson("/api/frame", { image, ts: Date.now() / 1000 });
+        if (data.status === "event") {
+          log(data.analysis || "检测到事件", "event");
+          lastText.textContent = "检测到事件";
+        } else if (data.status === "no_event") {
+          lastText.textContent = "无事件";
+        } else if (data.status === "skipped_busy") {
+          lastText.textContent = "推理繁忙，跳帧";
+        }
+        await refreshState();
+      } catch (error) {
+        log(`帧处理失败：${error.message}`, "error");
+      } finally {
+        frameInFlight = false;
+      }
+    }
+
+    function scheduleLoop() {
+      clearTimeout(loopTimer);
+      if (!running) {
+        return;
+      }
+      const delay = Math.max(300, numberValue("captureMs", 900));
+      loopTimer = setTimeout(async () => {
+        await pushFrame();
+        scheduleLoop();
+      }, delay);
+    }
+
+    async function refreshState() {
+      const response = await fetch("/api/state");
+      if (!response.ok) {
+        return;
+      }
+      const s = await response.json();
+      framesEl.textContent = s.processed_frames || 0;
+      skippedEl.textContent = s.skipped_frames || 0;
+      eventsEl.textContent = s.events_sent || 0;
+      busyEl.textContent = s.busy ? "busy" : "idle";
+      if (!running && s.active) {
+        statusPill.textContent = "服务端运行中";
+        running = true;
+        stopBtn.disabled = false;
+        startBtn.disabled = true;
+      }
+    }
+
+    async function start() {
+      startBtn.disabled = true;
+      try {
+        var p = document.getElementById("preview");
+        p.src = "";
+        const rtspUrl = value("rtspUrl");
+        const isMulti = rtspUrl === "multi";
+        const body = {
+          rule: value("rule"),
+          webhook_url: value("webhook") || undefined,
+          rtsp_url: isMulti ? "" : (rtspUrl || undefined),
+          rtsp_urls: isMulti ? RTSP_URLS : undefined,
+          cam_labels: isMulti ? CAM_LABELS : undefined,
+          high_quality: document.getElementById("highQuality").checked,
+          generate_interval_sec: numberValue("generateSec", 0.9),
+          notify_cooldown_sec: numberValue("cooldownSec", 12),
+        };
+        const data = await postJson("/api/start", body);
+        running = true;
+        stopBtn.disabled = false;
+        if (data.rtsp_connected) {
+          statusPill.textContent = isMulti ? "多路RTSP监控中" : "RTSP 监控中";
+          log(isMulti ? "三路监控已启动，轮询分析中..." : "RTSP 监控已启动，模型分析中...");
+          video.style.display = "none";
+          if (isMulti) {
+            reloadMultiGrid();
+          } else {
+            p.style.display = "block";
+            p.style.objectFit = "cover";
+            p.src = "/api/preview_monitor";
+          }
+          empty.style.display = "none";
+        } else if (data.webhook_configured) {
+          statusPill.textContent = "监控中，通知已配置";
+          log("监控已启动，LiveKit / ASR / TTS 均未参与。");
+        } else {
+          statusPill.textContent = "监控中，未配置通知";
+          log("监控已启动，LiveKit / ASR / TTS 均未参与。");
+        }
+      } catch (error) {
+        log(`启动失败：${error.message}`, "error");
+        startBtn.disabled = false;
+      }
+    }
+
+    async function stop() {
+      running = false;
+      clearTimeout(loopTimer);
+      stopBtn.disabled = true;
+      try {
+        await postJson("/api/stop", {});
+      } catch (error) {
+        log(`停止请求失败：${error.message}`, "error");
+      }
+      statusPill.textContent = "已停止";
+      startBtn.disabled = false;
+      log("监控已停止。切回预览...");
+      switchPreview(value("rtspUrl"));
+    }
+
+    async function testWebhook() {
+      testBtn.disabled = true;
+      try {
+        const data = await postJson("/api/test_webhook", {
+          webhook_url: value("webhook") || undefined,
+          message: `MiniCPM-o 本机视频监控测试 ${new Date().toLocaleString()}`,
+        });
+        log(data.ok ? "测试通知发送成功。" : "测试通知未发送，检查 webhook 配置。", data.ok ? "event" : "error");
+      } catch (error) {
+        log(`测试通知失败：${error.message}`, "error");
+      } finally {
+        testBtn.disabled = false;
+      }
+    }
+
+    startBtn.addEventListener("click", start);
+    stopBtn.addEventListener("click", stop);
+    testBtn.addEventListener("click", testWebhook);
+    clearBtn.addEventListener("click", () => {
+      logEl.innerHTML = "";
+    });
+
+    document.getElementById("rtspUrl").addEventListener("change", function () {
+      if (!running) {
+        switchPreview(this.value);
+      }
+    });
+
+    setInterval(refreshState, 2000);
+    refreshState();
+    switchPreview(value("rtspUrl"));
+  </script>
+</body>
+</html>

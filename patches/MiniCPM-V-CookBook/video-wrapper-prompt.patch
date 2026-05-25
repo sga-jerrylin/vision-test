@@ -1,0 +1,378 @@
+diff --git a/demo/web_demo/WebRTC_Demo/cpp_server/minicpmo_cpp_http_server.py b/demo/web_demo/WebRTC_Demo/cpp_server/minicpmo_cpp_http_server.py
+index cc4675c..233cd1e 100644
+--- a/demo/web_demo/WebRTC_Demo/cpp_server/minicpmo_cpp_http_server.py
++++ b/demo/web_demo/WebRTC_Demo/cpp_server/minicpmo_cpp_http_server.py
+@@ -1,4 +1,4 @@
+-"""
++﻿"""
+ MiniCPMO C++ 后端 HTTP 服务器（统一版：支持单工/双工模式切换）
+ 通过 HTTP 接口包装 C++ llama-server 的功能，对外提供与 Python 版本一致的 API
+ 
+@@ -19,7 +19,7 @@ from PIL import Image
+ from contextlib import asynccontextmanager
+ from typing import Optional, List, Dict, Any
+ from datetime import datetime
+-from fastapi import FastAPI, HTTPException
++from fastapi import FastAPI, HTTPException, Request
+ from fastapi.responses import StreamingResponse, JSONResponse
+ from fastapi.middleware.cors import CORSMiddleware
+ from pydantic import BaseModel
+@@ -35,6 +35,16 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
+ import uuid
+ import shutil
+ 
++# Local control-plane calls must never go through a desktop HTTP proxy.
++NO_PROXY_ENVS = ("NO_PROXY", "no_proxy")
++for _name in NO_PROXY_ENVS:
++    _current = os.environ.get(_name, "")
++    _items = [x.strip() for x in _current.split(",") if x.strip()]
++    for _host in ("127.0.0.1", "localhost", "::1"):
++        if _host not in _items:
++            _items.append(_host)
++    os.environ[_name] = ",".join(_items)
++
+ # ====================== 配置 ======================
+ # 注意: Python Token2Wav 现在由 C++ 程序直接通过 subprocess 调用
+ # C++ t2w_thread 会启动 Python 服务进程处理 audio tokens 并生成 WAV 文件
+@@ -59,10 +69,13 @@ DEFAULT_N_GPU_LAYERS = int(os.environ.get("N_GPU_LAYERS", "99"))
+ FIXED_TIMBRE_PATH = os.environ.get("REF_AUDIO", "")  # 默认在启动时从 LLAMACPP_ROOT 推导
+ 
+ # 视觉编码器后端: "metal"(默认，GPU) 或 "coreml"(ANE加速，macOS专用)
+-VISION_BACKEND = os.environ.get("VISION_BACKEND", "metal")
++VISION_BACKEND = os.environ.get("VISION_BACKEND", "")
+ 
+ # Token2Wav device: "gpu:1"(默认，GPU加速) 或 "cpu"(节省GPU显存，适合16GB内存机型)
+ TOKEN2WAV_DEVICE = os.environ.get("TOKEN2WAV_DEVICE", "gpu:0") # 默认应该使用gpu:0
++TTS_GPU_LAYERS = int(os.environ.get("TTS_GPU_LAYERS", "99"))
++USE_TTS = os.environ.get("MINICPMO_USE_TTS", "1").lower() not in ("0", "false", "no", "off")
++USE_AUDIO_ENCODER = os.environ.get("MINICPMO_USE_AUDIO_ENCODER", "1").lower() not in ("0", "false", "no", "off")
+ 
+ def auto_detect_llm_model(model_dir: str) -> str:
+     """自动从模型目录检测 LLM GGUF 文件
+@@ -314,11 +327,12 @@ def restart_cpp_server():
+         
+         cpp_request = {
+             "media_type": saved_msg_type,      # 恢复之前的模式
+-            "use_tts": True,
++            "use_tts": USE_TTS,
++            "use_audio": USE_AUDIO_ENCODER,
+             "duplex_mode": saved_duplex_mode,
+             "model_dir": model_dir,
+             "tts_bin_dir": tts_bin_dir,
+-            "tts_gpu_layers": 100,
++            "tts_gpu_layers": TTS_GPU_LAYERS,
+             "token2wav_device": TOKEN2WAV_DEVICE,
+             "output_dir": CPP_OUTPUT_DIR,
+         }
+@@ -799,7 +813,7 @@ async def lifespan(app: FastAPI):
+         raise
+     
+     # 创建 HTTP 客户端
+-    http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
++    http_client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
+     
+     # 🔧 [预初始化] Server 启动时就初始化所有模块（LLM+TTS+APM+Python T2W）
+     # 这样用户调用 /omni/init_sys_prompt 时就不需要等待 ~12s 了
+@@ -811,11 +825,12 @@ async def lifespan(app: FastAPI):
+         
+         pre_init_request = {
+             "media_type": 2,  # 🔧 [修复] 使用 omni 模式预初始化，这样 VPM 也会被加载
+-            "use_tts": True,
++            "use_tts": USE_TTS,
++            "use_audio": USE_AUDIO_ENCODER,
+             "duplex_mode": app.state.default_duplex_mode,
+             "model_dir": model_dir,
+             "tts_bin_dir": tts_bin_dir,
+-            "tts_gpu_layers": 100,
++            "tts_gpu_layers": TTS_GPU_LAYERS,
+             "token2wav_device": TOKEN2WAV_DEVICE,
+             "output_dir": CPP_OUTPUT_DIR,
+         }
+@@ -881,10 +896,15 @@ class InitSysPromptRequest(BaseModel):
+     high_quality_mode: Optional[bool] = False  # 🔧 [高清模式] 启用图片切片 (max_slice_nums=2)
+     high_fps_mode: Optional[bool] = False  # 🔧 [高刷模式] 1秒5帧 stack
+     language: Optional[str] = "zh"  # 🔧 [语言切换] "zh" 中文, "en" 英文
++    use_audio: Optional[bool] = None
++    use_tts: Optional[bool] = None
++    task_prompt_text: Optional[str] = None
++    assistant_prompt: Optional[str] = None
+ 
+ class StreamingPrefillRequest(BaseModel):
+     audio: Optional[str] = None  # base64编码的音频
+     image: Optional[str] = None  # base64编码的图片
++    prompt: Optional[str] = None  # optional per-frame text instruction
+     # 🔧 [高刷模式] 图片按 image_audio_id 分组
+     image_audio_id: Optional[int] = None  # 图片音频关联ID（用于标记同一组音频和图片）
+     frame_index: Optional[int] = None  # 当前帧索引 (0=主图, 1-4=子图用于stack)
+@@ -1075,6 +1095,26 @@ async def init_sys_prompt(request: InitSysPromptRequest):
+         
+         # 🔧 [语言切换] 设置语言 ("zh" 或 "en")
+         language = request.language if request.language is not None else "zh"
++        use_tts = USE_TTS if request.use_tts is None else request.use_tts
++        use_audio = USE_AUDIO_ENCODER if request.use_audio is None else request.use_audio
++        task_prompt_text = (request.task_prompt_text or "").strip()
++        assistant_prompt = (request.assistant_prompt or "").strip()
++        monitor_rule_ascii = task_prompt_text.encode("ascii", "ignore").decode("ascii").strip()
++        if not monitor_rule_ascii:
++            monitor_rule_ascii = (
++                "Notify when a person appears. Describe likely gender, clothing, "
++                "visible features, and movement direction."
++            )
++        if not assistant_prompt:
++            assistant_prompt = (
++                "<|im_start|>system\n"
++                "You are a realtime video monitoring assistant. Inspect only the current video frame. "
++                "Answer in Simplified Chinese. If the monitor rule is triggered, describe the event, "
++                "likely gender if visible, clothing, notable features, and movement direction. "
++                "If nothing relevant is visible, answer exactly: NO_EVENT.\n"
++                f"Monitor rule: {monitor_rule_ascii}\n"
++                "<|im_end|>\n<|im_start|>user\n"
++            )
+         
+         is_audio_mode = (msg_type == 1)
+         mode_name = "audio" if is_audio_mode else "omni"
+@@ -1083,11 +1123,22 @@ async def init_sys_prompt(request: InitSysPromptRequest):
+         fps_name = "高刷" if high_fps_mode else "标准帧率"
+         
+         # 检测 duplex_mode 是否变化（用于警告日志）
+-        # 注意：每个 server 实例的 duplex_mode 在启动时确定，运行时不应改变
++        # 默认不允许运行时切换，但 video-only 场景（无 ASR/TTS）允许切到单工，
++        # 否则会长期停留在 LISTEN 状态，无法稳定输出文本监控结果。
+         duplex_mode_changed = model_state_initialized and (current_duplex_mode != duplex_mode)
+         if duplex_mode_changed:
+-            print(f"[警告] duplex_mode 从 {current_duplex_mode} 变为 {duplex_mode}，但 server 已初始化，此次请求的 duplex_mode 将被忽略", flush=True)
+-            duplex_mode = current_duplex_mode  # 保持原有模式
++            if (use_audio is False) and (use_tts is False):
++                print(
++                    f"[模式切换] video-only 允许 duplex_mode 从 {current_duplex_mode} 切换为 {duplex_mode}",
++                    flush=True
++                )
++            else:
++                print(
++                    f"[警告] duplex_mode 从 {current_duplex_mode} 变为 {duplex_mode}，"
++                    "但 server 已初始化，此次请求的 duplex_mode 将被忽略",
++                    flush=True
++                )
++                duplex_mode = current_duplex_mode  # 保持原有模式
+         
+         # 🔧 [修复] 检测 media_type 是否变化（audio <-> omni）
+         # 不同模式需要不同的 system prompt
+@@ -1107,17 +1158,20 @@ async def init_sys_prompt(request: InitSysPromptRequest):
+             
+             cpp_request = {
+                 "media_type": msg_type,      # 1=audio, 2=omni
+-                "use_tts": True,             # 启用 TTS 语音合成
++                "use_tts": use_tts,          # 启用 TTS 语音合成
++                "use_audio": use_audio,
+                 "duplex_mode": duplex_mode,  # 双工/单工模式
+                 "model_dir": model_dir,
+                 "tts_bin_dir": tts_bin_dir,
+-                "tts_gpu_layers": 100,
++                "tts_gpu_layers": TTS_GPU_LAYERS,
+                 "token2wav_device": TOKEN2WAV_DEVICE,
+                 "output_dir": CPP_OUTPUT_DIR,  # 🔧 [多实例支持] 传递配置的输出目录
+                 "language": language,        # 🔧 [语言切换] "zh" 或 "en"
+             }
+             
+             # 视觉编码器后端
++            if assistant_prompt:
++                cpp_request["assistant_prompt"] = assistant_prompt
+             cpp_request["vision_backend"] = VISION_BACKEND
+             
+             # 🔧 [高清模式] 设置 max_slice_nums
+@@ -1161,10 +1215,14 @@ async def init_sys_prompt(request: InitSysPromptRequest):
+             update_request = {
+                 "media_type": msg_type,
+                 "duplex_mode": duplex_mode,
++                "use_audio": use_audio,
++                "use_tts": use_tts,
+                 "language": language,  # 🔧 [语言切换]
+             }
+             
+             # 使用固定音色文件重新 prefill system prompt
++            if assistant_prompt:
++                update_request["assistant_prompt"] = assistant_prompt
+             if os.path.exists(FIXED_TIMBRE_PATH):
+                 update_request["voice_audio"] = FIXED_TIMBRE_PATH
+             
+@@ -1195,10 +1253,14 @@ async def init_sys_prompt(request: InitSysPromptRequest):
+             update_request = {
+                 "media_type": msg_type,
+                 "duplex_mode": duplex_mode,
++                "use_audio": use_audio,
++                "use_tts": use_tts,
+                 "language": language,  # 🔧 [语言切换]
+             }
+             
+             # 使用固定音色文件重新 prefill system prompt
++            if assistant_prompt:
++                update_request["assistant_prompt"] = assistant_prompt
+             if os.path.exists(FIXED_TIMBRE_PATH):
+                 update_request["voice_audio"] = FIXED_TIMBRE_PATH
+             
+@@ -1645,6 +1707,7 @@ async def _streaming_prefill_highfps_direct(
+     # 调用 C++ prefill
+     t0 = time.time()
+     cpp_success = True
++    frame_prompt = request.prompt or ""
+     
+     # 🔧 [高清+高刷] 根据 is_main_image 决定 max_slice_nums
+     # 主图且高清开启：max_slice_nums=2（切片）
+@@ -1661,7 +1724,8 @@ async def _streaming_prefill_highfps_direct(
+         cpp_request = {
+             "audio_path_prefix": temp_audio_path,
+             "img_path_prefix": "",
+-            "cnt": cnt
++            "cnt": cnt,
++            "prompt": frame_prompt
+         }
+         resp = await http_client.post(
+             f"{CPP_SERVER_URL}/v1/stream/prefill",
+@@ -1676,7 +1740,8 @@ async def _streaming_prefill_highfps_direct(
+                 "audio_path_prefix": temp_audio_path if i == 0 else "",
+                 "img_path_prefix": img_path,
+                 "cnt": cnt + i,
+-                "max_slice_nums": slice_nums  # 🔧 [高清+高刷] 传入切片参数
++                "max_slice_nums": slice_nums,  # 🔧 [高清+高刷] 传入切片参数
++                "prompt": frame_prompt if i == 0 else ""
+             }
+             resp = await http_client.post(
+                 f"{CPP_SERVER_URL}/v1/stream/prefill",
+@@ -1838,7 +1903,7 @@ async def _streaming_prefill_simplex(
+ 
+ 
+ @app.post("/omni/streaming_generate")
+-async def streaming_generate():
++async def streaming_generate(request: Request):
+     """流式生成
+     
+     根据 duplex_mode 使用不同的处理逻辑：
+@@ -1860,11 +1925,32 @@ async def streaming_generate():
+     # 【重置 break 标志】开始新一轮生成时，重置 is_breaking
+     is_breaking = False
+     
++    requested_mode = None
++    try:
++        payload = await request.json()
++    except Exception:
++        payload = {}
++    if isinstance(payload, dict):
++        mode_value = str(payload.get("mode", "")).strip().lower()
++        if mode_value in ("simplex", "duplex"):
++            requested_mode = mode_value
++        elif mode_value:
++            print(f"[Generate] 忽略未知 mode={mode_value}", flush=True)
++    
++    effective_duplex_mode = current_duplex_mode
++    if requested_mode is not None:
++        effective_duplex_mode = (requested_mode == "duplex")
++    
+     generate_request_time = time.time()
+-    print(f"[Generate] 开始生成 (Round #{current_round_number}, duplex_mode={current_duplex_mode})", flush=True)
++    print(
++        f"[Generate] 开始生成 (Round #{current_round_number}, "
++        f"duplex_mode={current_duplex_mode}, requested_mode={requested_mode}, "
++        f"effective_duplex_mode={effective_duplex_mode})",
++        flush=True
++    )
+     
+-    # 根据模式选择不同的实现
+-    if current_duplex_mode:
++    # 根据最终模式选择不同实现
++    if effective_duplex_mode:
+         return await _streaming_generate_duplex(generate_request_time)
+     else:
+         return await _streaming_generate_simplex(generate_request_time)
+@@ -1956,6 +2042,9 @@ async def _streaming_generate_simplex(generate_request_time):
+                 "stream": True,
+                 "round_idx": current_round_number
+             }
++            if not USE_TTS:
++                cpp_request["n_predict"] = int(os.environ.get("MINICPMO_VIDEO_ONLY_N_PREDICT", "96"))
++                cpp_request["max_tgt_len"] = int(os.environ.get("MINICPMO_VIDEO_ONLY_MAX_TGT_LEN", "256"))
+             
+             print(f"[streaming_generate] 调用 C++ decode: {json.dumps(cpp_request)} [单工]", flush=True)
+             
+@@ -1999,6 +2088,26 @@ async def _streaming_generate_simplex(generate_request_time):
+                     except:
+                         pass
+                 return ""
++
++            def parse_sse_text_payload(raw_sse: str):
++                texts = []
++                if not raw_sse:
++                    return texts
++                for raw_line in raw_sse.splitlines():
++                    line = raw_line.strip()
++                    if not line.startswith("data:"):
++                        continue
++                    payload = line[5:].strip()
++                    if not payload:
++                        continue
++                    try:
++                        event_data = json.loads(payload)
++                    except json.JSONDecodeError:
++                        continue
++                    text_value = event_data.get("text") or event_data.get("content")
++                    if text_value:
++                        texts.append(str(text_value))
++                return texts
+             
+             for _ in range(int(max_wait / check_interval)):
+                 await asyncio.sleep(check_interval)
+@@ -2016,6 +2125,39 @@ async def _streaming_generate_simplex(generate_request_time):
+                             print(f"[streaming_generate] C++ decode 返回错误: {resp.text}", flush=True)
+                         else:
+                             print(f"[streaming_generate] C++ decode 完成 [单工]", flush=True)
++                            if not USE_TTS:
++                                text_chunks = parse_sse_text_payload(resp.text)
++                                if text_chunks:
++                                    for text_chunk in text_chunks:
++                                        if first_text_time is None:
++                                            first_text_time = (time.time() - generate_start_time) * 1000
++                                            print(f"[⏱️ Generate 文本首响] {first_text_time:.1f}ms [单工]", flush=True)
++                                        all_generated_text.append(text_chunk)
++                                        chunk_data = {
++                                            "chunk_idx": sent_chunk_count,
++                                            "chunk_data": {
++                                                "text": text_chunk,
++                                                "sample_rate": sr
++                                            }
++                                        }
++                                        print(f"[Chunk #{sent_chunk_count}] 发送文本 (TTS关闭) [单工]", flush=True)
++                                        yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
++                                        sent_chunk_count += 1
++                                else:
++                                    fallback_text = "NO_EVENT"
++                                    all_generated_text.append(fallback_text)
++                                    chunk_data = {
++                                        "chunk_idx": sent_chunk_count,
++                                        "chunk_data": {
++                                            "text": fallback_text,
++                                            "sample_rate": sr
++                                        }
++                                    }
++                                    print("[streaming_generate] decode无文本输出，回退 NO_EVENT [单工]", flush=True)
++                                    yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
++                                    sent_chunk_count += 1
++                                print("[streaming_generate] TTS关闭文本流程已完成，结束本轮等待 [单工]", flush=True)
++                                break
+                     except Exception as e:
+                         print(f"[streaming_generate] C++ decode 异常: {e}", flush=True)
+                 
+@@ -2452,6 +2594,15 @@ async def _streaming_generate_duplex(generate_request_time):
+                                             if first_text_time is None:
+                                                 first_text_time = (time.time() - generate_start_time) * 1000
+                                                 print(f"[streaming_generate] 文本首响: {first_text_time:.1f}ms [双工]", flush=True)
++                                            if not USE_TTS:
++                                                text_chunk = {
++                                                    "chunk_idx": sent_chunk_count,
++                                                    "chunk_data": {
++                                                        "text": event_data["text"],
++                                                        "sample_rate": 24000
++                                                    }
++                                                }
++                                                yield f"data: {json.dumps(text_chunk, ensure_ascii=False)}\n\n"
+                                         
+                                     except json.JSONDecodeError:
+                                         pass
