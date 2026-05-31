@@ -136,7 +136,7 @@
 
     .multi-grid {
       display: none;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(2, 1fr);
       gap: 3px;
       width: 100%;
       position: relative;
@@ -406,9 +406,10 @@
           <video id="video" autoplay playsinline muted></video>
           <img id="preview" alt="RTSP preview" />
           <div class="multi-grid" id="multiGrid" style="display:none">
-             <div class="multi-cell"></div>
-             <div class="multi-cell"></div>
-             <div class="multi-cell"></div>
+            <div class="multi-cell"></div>
+            <div class="multi-cell"></div>
+            <div class="multi-cell"></div>
+            <div class="multi-cell"></div>
            </div>
           <div class="empty" id="empty">
             <div>
@@ -442,7 +443,8 @@
             <option value="rtsp://192.168.10.11:554/user=admin&password=&channel=1&stream=0.sdp?">CAM01 - 192.168.10.11</option>
             <option value="rtsp://admin:123456@192.168.10.200:554/h264/ch1/main/av_stream">IP Camera - 192.168.10.200</option>
             <option value="rtsp://admin:123456@192.168.10.221:554/h264/ch1/main/av_stream">IP Camera - 192.168.10.221</option>
-            <option value="multi">全部摄像头 (3路同时)</option>
+            <option value="rtsp://admin:12qwaszx@192.168.10.3:554/h264/ch1/main/av_stream">CAM04 - 192.168.10.3</option>
+            <option value="multi">全部摄像头 (4路同时)</option>
           </select>
         </div>
 
@@ -540,14 +542,15 @@
       "rtsp://192.168.10.11:554/user=admin&password=&channel=1&stream=0.sdp?",
       "rtsp://admin:123456@192.168.10.200:554/h264/ch1/main/av_stream",
       "rtsp://admin:123456@192.168.10.221:554/h264/ch1/main/av_stream",
+      "rtsp://admin:12qwaszx@192.168.10.3:554/h264/ch1/main/av_stream",
     ];
-    const CAM_LABELS = ["CAM01 (192.168.10.11)", "IP Camera (192.168.10.200)", "IP Camera (192.168.10.221)"];
+    const CAM_LABELS = ["CAM01 (192.168.10.11)", "IP Camera (192.168.10.200)", "IP Camera (192.168.10.221)", "CAM04 (192.168.10.3)"];
 
     function switchPreview(rtspUrl) {
       if (!rtspUrl) return;
       if (rtspUrl === "multi") {
         reloadMultiGrid();
-        log("预览切换：全部摄像头 (3路)");
+        log("预览切换：全部摄像头 (4路)");
         return;
       }
       video.style.display = "none";
@@ -567,7 +570,7 @@
       p.src = "";
       multiGrid.style.display = "grid";
       empty.style.display = "none";
-      for (var i = 0; i < 3; i++) {
+      for (var i = 0; i < 4; i++) {
         var cell = multiGrid.children[i];
         var old = cell.querySelector("img");
         if (old) { old.src = ""; cell.removeChild(old); }
